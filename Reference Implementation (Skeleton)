@@ -1,0 +1,670 @@
+"""
+CM-LLM: Cognitive Memory-Augmented Large Language Models
+Reference Implementation (Skeleton)
+
+Implements the five core components of the CM-LLM architecture:
+
+    1. Distributional embeddings  — concepts as Gaussian distributions N(μ, Σ);
+                                    confidence = 1 / det(Σ).
+    2. Claim-type-specific decay  — covariance expands (confidence shrinks) at a
+                                    rate determined by claim type, not document age.
+    3. Three-tier memory          — active (anchored, high-stability), episodic
+                                    (plausible, decaying), cold (failed, inert).
+    4. Structural bridges         — orthogonal Procrustes alignment between memory
+                                    regions; bridge quality is a measurable scalar.
+    5. Spectral clustering        — graph Laplacian decomposition for emergent
+                                    domain discovery (no predefined categories).
+
+Architectural invariant
+-----------------------
+No node may enter active memory without an explicit real-world anchor
+(source URL, document ID, direct observation).  This is enforced by
+`CMLLMMemory.add_node` and makes confabulation structurally impossible
+in the operational reasoning layer.
+
+Known limitations of this skeleton
+-----------------------------------
+- `compute_stability` requires intermediate layer representations, which
+  most hosted LLM APIs do not expose.  Substitute a fixed estimate or an
+  entropy proxy for API-only deployments.
+- Distributional embeddings are initialised with a diagonal covariance;
+  a production system would learn Σ from embedding variance across sources.
+- Episodic nodes with no anchor eventually decay to cold storage; the
+  reinforcement mechanism (promoting episodic → active when an anchor
+  arrives) is left as a TODO for implementors.
+- The three-agent validation loop (epistemic agent / faithful amplifier /
+  adversarial falsifier) is not implemented here; this skeleton covers
+  only the memory substrate.
+
+Dependencies
+------------
+    numpy, scipy, scikit-learn
+
+Integration target: any local LLM that exposes layer-level embeddings
+(e.g. Llama 3, Mistral via llama.cpp with `--dump-kv-cache`).
+"""
+
+import numpy as np
+from numpy.linalg import svd
+from scipy.linalg import eigh          # symmetric eigendecomposition (numerically stable)
+from sklearn.cluster import KMeans
+from dataclasses import dataclass, field
+from typing import List, Dict, Optional, Tuple
+from datetime import datetime, timedelta
+import hashlib
+
+
+# =============================================================================
+# Data Structures
+# =============================================================================
+
+@dataclass
+class DistributionalEmbedding:
+    """
+    A concept represented as a Gaussian distribution N(μ, Σ).
+    
+    Attributes:
+        mu: Mean vector (prototypical meaning)
+        sigma: Covariance matrix (semantic uncertainty)
+        anchor: Explicit source (URL, document ID, etc.)
+        claim_type: Type of claim (affects decay rate)
+        created_at: Timestamp of creation
+        last_reinforced: Last time this node was reinforced
+    """
+    mu: np.ndarray
+    sigma: np.ndarray
+    anchor: str
+    claim_type: str
+    created_at: datetime = field(default_factory=datetime.now)
+    last_reinforced: datetime = field(default_factory=datetime.now)
+    
+    @property
+    def confidence(self) -> float:
+        """Confidence is the concentration of the distribution: 1 / det(Σ)."""
+        det = np.linalg.det(self.sigma)
+        if det <= 0:
+            return 1e-10  # Avoid division by zero
+        return 1.0 / det
+    
+    @property
+    def dimension(self) -> int:
+        return len(self.mu)
+
+
+@dataclass
+class MemoryNode:
+    """
+    A node in memory with its embedding and metadata.
+    
+    Attributes:
+        id: Unique identifier (hash of anchor + content)
+        embedding: Distributional embedding
+        stability: Stability score (0 to 1)
+        confidence: Current confidence (after decay)
+    """
+    id: str
+    embedding: DistributionalEmbedding
+    stability: float = 0.0
+    confidence: float = 1.0
+
+
+@dataclass
+class Bridge:
+    """
+    A structural bridge between two memory regions.
+    
+    Attributes:
+        source_region: List of node IDs in source region
+        target_region: List of node IDs in target region
+        Q: Orthogonal transformation matrix (from Procrustes)
+        error: Normalized residual error (quality measure)
+    """
+    source_region: List[str]
+    target_region: List[str]
+    Q: np.ndarray
+    error: float
+
+
+# =============================================================================
+# Claim Type Decay Coefficients
+# =============================================================================
+
+DECAY_COEFFICIENTS = {
+    'market_data': 0.10,        # Half-life ≈ 1 week
+    'opinion': 0.05,            # Half-life ≈ 3 months
+    'scientific_fact': 0.001,   # Half-life ≈ 5 years
+    'mathematical': 0.0001,     # Half-life ≈ 50 years
+}
+
+DEFAULT_DECAY = 0.05  # Default for unknown claim types
+
+
+# =============================================================================
+# Core Functions
+# =============================================================================
+
+def compute_stability(layer_embeddings: List[np.ndarray]) -> float:
+    """
+    Compute representation stability across transformer layers.
+
+    Measures how consistently a concept is encoded as the representation
+    propagates through the network.  A sequence that converges (small
+    pairwise distances) yields stability close to 1 ("mature" concept);
+    one that oscillates yields stability close to 0.
+
+    Formula:
+        mean_sq_dist = (1 / C(L,2)) * Σ_{i<j} ||h_i − h_j||²
+        stability    = 1 / (1 + mean_sq_dist)
+
+    where C(L,2) = L*(L-1)/2 is the number of distinct pairs.
+
+    Note: in production this requires access to intermediate layer
+    representations, which most hosted LLM APIs do not expose.
+    For API-only deployments a fixed stability estimate (e.g. 0.8)
+    or a proxy metric (token-level entropy) should be substituted.
+
+    Args:
+        layer_embeddings: Embeddings from each transformer layer, shape (d,) each.
+
+    Returns:
+        Stability score in [0, 1].
+    """
+    L = len(layer_embeddings)
+    if L < 2:
+        return 1.0  # Single layer is trivially stable
+
+    # Normalise each embedding to unit length so the metric is
+    # dimension-independent (equivalent to measuring 1 - cosine similarity).
+    norms = [np.linalg.norm(h) for h in layer_embeddings]
+    normed = [
+        h / n if n > 0 else h
+        for h, n in zip(layer_embeddings, norms)
+    ]
+
+    # Mean pairwise squared distance on the unit sphere ∈ [0, 4]
+    total_distance = 0.0
+    count = 0
+    for i in range(L):
+        for j in range(i + 1, L):
+            diff = normed[i] - normed[j]
+            total_distance += float(np.dot(diff, diff))
+            count += 1
+
+    if count == 0:
+        return 1.0
+
+    mean_squared_distance = total_distance / count
+    # Scale so that fully aligned layers (distance=0) → 1.0 and
+    # fully opposite layers (max distance=4) → 1/5 ≈ 0.2.
+    stability = 1.0 / (1.0 + mean_squared_distance)
+
+    return stability
+
+
+def apply_decay(node: MemoryNode, dt: float) -> float:
+    """
+    Apply claim-type-specific decay to a memory node.
+    
+    The covariance expands over time: Σ(t+Δt) = Σ(t) * e^(α * Δt)
+    Confidence decays exponentially: confidence(t) = confidence(0) * e^(-α * t)
+    
+    Args:
+        node: Memory node to decay
+        dt: Time delta in days
+        
+    Returns:
+        New confidence after decay
+    """
+    alpha = DECAY_COEFFICIENTS.get(node.embedding.claim_type, DEFAULT_DECAY)
+    
+    # Expand covariance
+    expansion_factor = np.exp(alpha * dt)
+    node.embedding.sigma = node.embedding.sigma * expansion_factor
+    
+    # Update confidence
+    node.confidence = node.embedding.confidence
+    
+    return node.confidence
+
+
+def procrustes_alignment(X: np.ndarray, Y: np.ndarray) -> Tuple[np.ndarray, float]:
+    """
+    Orthogonal Procrustes analysis to align two sets of points.
+    
+    Given corresponding nodes X and Y:
+    1. Centering: X̄ = X - μ_X, Ȳ = Y - μ_Y
+    2. Cross-covariance: C = X̄^T * Ȳ
+    3. SVD: C = U * S * V^T
+    4. Optimal transformation: Q = V * U^T
+    
+    Args:
+        X: Source points (n x d)
+        Y: Target points (n x d)
+        
+    Returns:
+        Q: Orthogonal transformation matrix (d x d)
+        error: Normalized residual error
+    """
+    # Centering
+    X_mean = X.mean(axis=0, keepdims=True)
+    Y_mean = Y.mean(axis=0, keepdims=True)
+    X_centered = X - X_mean
+    Y_centered = Y - Y_mean
+    
+    # Cross-covariance
+    C = X_centered.T @ Y_centered
+    
+    # SVD
+    U, S, Vt = svd(C)
+    
+    # Optimal transformation
+    Q = Vt.T @ U.T
+    
+    # Compute residual error
+    X_aligned = X_centered @ Q
+    residual = np.linalg.norm(X_aligned - Y_centered, 'fro')
+    norm = np.linalg.norm(Y_centered, 'fro')
+    error = residual / norm if norm > 0 else 0.0
+    
+    return Q, error
+
+
+def spectral_clustering(embeddings: np.ndarray, n_clusters: int) -> np.ndarray:
+    """
+    Spectral clustering on embedding space.
+    
+    The algorithm is the spectral decomposition of the graph Laplacian:
+    1. Similarity matrix: W_ij = exp(-||x_i - x_j||^2 / (2 * σ^2))
+    2. Laplacian: L = D - W, where D_ii = sum_j W_ij
+    3. Decomposition: L * v_k = λ_k * v_k
+    4. Clustering on first k eigenvectors (Fiedler spectral gap)
+    
+    Args:
+        embeddings: Matrix of embeddings (n x d)
+        n_clusters: Number of clusters to find
+        
+    Returns:
+        labels: Cluster assignments (n,)
+    """
+    n = embeddings.shape[0]
+    
+    # Similarity matrix (RBF kernel)
+    sigma = 1.0
+    distances = np.sum((embeddings[:, np.newaxis, :] - embeddings[np.newaxis, :, :]) ** 2, axis=2)
+    W = np.exp(-distances / (2 * sigma ** 2))
+    
+    # Laplacian
+    D = np.diag(W.sum(axis=1))
+    L = D - W
+    
+    # Eigendecomposition — use eigh (symmetric solver): real eigenvalues, faster, stable
+    eigenvalues, eigenvectors = eigh(L)
+    
+    # eigh returns eigenvalues in ascending order; skip trivial zero (index 0)
+    embedding_reduced = eigenvectors[:, 1:n_clusters + 1].real
+    
+    # K-means on the Fiedler embedding
+    kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init="auto")
+    labels = kmeans.fit_predict(embedding_reduced)
+    
+    return labels
+
+
+# =============================================================================
+# Memory System
+# =============================================================================
+
+class CMLLMMemory:
+    """
+    Three-level memory system for CM-LLM.
+    
+    Levels:
+    - Active memory: Operational reasoning (stability > 0.9 + explicit anchor)
+    - Episodic memory: Hypotheses under exploration (stability > 0.7 OR partial anchor)
+    - Cold storage: Systematic errors and confabulation patterns (confidence < 0.1)
+    """
+    
+    def __init__(self, embedding_dim: int = 768):
+        self.embedding_dim = embedding_dim
+        self.active_memory: Dict[str, MemoryNode] = {}
+        self.episodic_memory: Dict[str, MemoryNode] = {}
+        self.cold_storage: Dict[str, MemoryNode] = {}
+        self.bridges: List[Bridge] = []
+        self.domains: Dict[int, List[str]] = {}  # cluster_id -> node_ids
+    
+    def _generate_id(self, anchor: str, content: str) -> str:
+        """Generate unique node ID from anchor and content."""
+        key = f"{anchor}:{content}"
+        return hashlib.sha256(key.encode()).hexdigest()[:16]
+    
+    def add_node(self, anchor: str, claim_type: str, 
+                 layer_embeddings: List[np.ndarray],
+                 mu: Optional[np.ndarray] = None) -> Tuple[str, str]:
+        """
+        Add a new node to memory.
+        
+        Admission criteria:
+        - Active memory: stability > 0.9 + explicit anchor + multiple validation
+        - Episodic memory: stability > 0.7 OR partial anchor
+        - Cold storage: confidence < 0.1 (after decay)
+        
+        Args:
+            anchor: Explicit source (URL, document ID, etc.)
+            claim_type: Type of claim (affects decay)
+            layer_embeddings: Embeddings from each transformer layer
+            mu: Mean vector (if None, use last layer embedding)
+            
+        Returns:
+            node_id: Unique identifier
+            memory_level: Which memory level the node was added to
+        """
+        # Compute stability
+        stability = compute_stability(layer_embeddings)
+        
+        # Create embedding
+        if mu is None:
+            mu = layer_embeddings[-1]  # Use last layer as prototype
+        
+        # Initialize covariance (diagonal, small uncertainty)
+        sigma = np.eye(self.embedding_dim) * 0.1
+        
+        embedding = DistributionalEmbedding(
+            mu=mu,
+            sigma=sigma,
+            anchor=anchor,
+            claim_type=claim_type
+        )
+        
+        node_id = self._generate_id(anchor, str(mu[:10]))  # Simplified
+        node = MemoryNode(
+            id=node_id,
+            embedding=embedding,
+            stability=stability,
+            confidence=embedding.confidence
+        )
+        
+        # Determine memory level.
+        # Architectural invariant (§3.1 of the spec): no node can enter active memory
+        # without an explicit real-world anchor.  Stability alone is insufficient.
+        # Episodic memory accepts high-stability nodes regardless of anchor (they may
+        # decay to cold if no anchor is ever provided).
+        if stability > 0.9 and anchor:
+            self.active_memory[node_id] = node
+            return node_id, 'active'
+        elif stability > 0.7:
+            # High stability but missing or weak anchor: episodic, not active.
+            # Will decay unless reinforced with a real anchor later.
+            self.episodic_memory[node_id] = node
+            return node_id, 'episodic'
+        else:
+            self.cold_storage[node_id] = node
+            return node_id, 'cold'
+    
+    def reinforce_node(self, node_id: str, anchor: str) -> bool:
+        """
+        Attach (or update) a real-world anchor to an episodic node and,
+        if stability already qualifies, promote it to active memory.
+
+        This is the mechanism by which a hypothesis graduates from
+        episodic memory to operational reality once evidence arrives.
+
+        Args:
+            node_id: ID of the node to reinforce.
+            anchor:  Verified source (URL, document ID, observation).
+
+        Returns:
+            True if the node was promoted to active memory, False otherwise.
+        """
+        if node_id not in self.episodic_memory:
+            return False
+
+        node = self.episodic_memory[node_id]
+        node.embedding.anchor = anchor
+        node.embedding.last_reinforced = datetime.now()
+
+        if node.stability > 0.9:
+            del self.episodic_memory[node_id]
+            self.active_memory[node_id] = node
+            return True
+
+        return False
+
+    def apply_decay_to_all(self, dt: float = 1.0) -> List[str]:
+        """
+        Apply decay to all nodes in memory.
+        
+        Nodes with confidence < 0.1 are moved to cold storage.
+        
+        Args:
+            dt: Time delta in days (default: 1 day)
+            
+        Returns:
+            List of node IDs that were moved to cold storage
+        """
+        moved_to_cold = []
+        
+        # Process active memory
+        for node_id, node in list(self.active_memory.items()):
+            new_confidence = apply_decay(node, dt)
+            if new_confidence < 0.1:
+                del self.active_memory[node_id]
+                self.cold_storage[node_id] = node
+                moved_to_cold.append(node_id)
+        
+        # Process episodic memory
+        for node_id, node in list(self.episodic_memory.items()):
+            new_confidence = apply_decay(node, dt)
+            if new_confidence < 0.1:
+                del self.episodic_memory[node_id]
+                self.cold_storage[node_id] = node
+                moved_to_cold.append(node_id)
+        
+        return moved_to_cold
+    
+    def find_bridge(self, region_a: List[str], region_b: List[str]) -> Optional[Bridge]:
+        """
+        Construct a structural bridge between two memory regions.
+        
+        Args:
+            region_a: List of node IDs in source region
+            region_b: List of node IDs in target region
+            
+        Returns:
+            Bridge object if successful, None if regions are incompatible
+        """
+        # Collect embeddings from both regions
+        embeddings_a = []
+        embeddings_b = []
+        
+        for node_id in region_a:
+            if node_id in self.active_memory:
+                embeddings_a.append(self.active_memory[node_id].embedding.mu)
+            elif node_id in self.episodic_memory:
+                embeddings_a.append(self.episodic_memory[node_id].embedding.mu)
+        
+        for node_id in region_b:
+            if node_id in self.active_memory:
+                embeddings_b.append(self.active_memory[node_id].embedding.mu)
+            elif node_id in self.episodic_memory:
+                embeddings_b.append(self.episodic_memory[node_id].embedding.mu)
+        
+        if len(embeddings_a) < 2 or len(embeddings_b) < 2:
+            return None  # Not enough points
+        
+        X = np.array(embeddings_a)
+        Y = np.array(embeddings_b)
+        
+        if X.shape != Y.shape:
+            # Pad or truncate to match (simplified: truncate)
+            min_len = min(X.shape[0], Y.shape[0])
+            X = X[:min_len]
+            Y = Y[:min_len]
+        
+        # Procrustes alignment
+        Q, error = procrustes_alignment(X, Y)
+        
+        # Only create bridge if error is acceptable
+        if error > 0.3:
+            return None  # Weak bridge, knowledge transfer risky
+        
+        bridge = Bridge(
+            source_region=region_a,
+            target_region=region_b,
+            Q=Q,
+            error=error
+        )
+        
+        self.bridges.append(bridge)
+        return bridge
+    
+    def recluster_domains(self, n_clusters: int = 5) -> Dict[int, List[str]]:
+        """
+        Perform spectral clustering to identify emergent domains.
+        
+        Args:
+            n_clusters: Number of clusters to find
+            
+        Returns:
+            Dictionary mapping cluster IDs to node IDs
+        """
+        # Collect all active memory embeddings
+        node_ids = list(self.active_memory.keys())
+        embeddings = np.array([
+            self.active_memory[nid].embedding.mu for nid in node_ids
+        ])
+        
+        if len(embeddings) < n_clusters:
+            return self.domains  # Not enough nodes
+        
+        # Spectral clustering
+        labels = spectral_clustering(embeddings, n_clusters)
+        
+        # Group by cluster
+        new_domains = {}
+        for i, label in enumerate(labels):
+            label_int = int(label)
+            if label_int not in new_domains:
+                new_domains[label_int] = []
+            new_domains[label_int].append(node_ids[i])
+        
+        self.domains = new_domains
+        return new_domains
+    
+    def query(self, query_embedding: np.ndarray, k: int = 5) -> List[Tuple[str, float]]:
+        """
+        Retrieve top-k most similar nodes from active memory.
+        
+        Args:
+            query_embedding: Query vector (d,)
+            k: Number of results
+            
+        Returns:
+            List of (node_id, similarity_score) tuples
+        """
+        similarities = []
+        
+        for node_id, node in self.active_memory.items():
+            # Cosine similarity
+            mu = node.embedding.mu
+            similarity = np.dot(query_embedding, mu) / (
+                np.linalg.norm(query_embedding) * np.linalg.norm(mu)
+            )
+            similarities.append((node_id, similarity))
+        
+        # Sort by similarity
+        similarities.sort(key=lambda x: x[1], reverse=True)
+        
+        return similarities[:k]
+    
+    def get_stats(self) -> Dict:
+        """Get statistics about memory state."""
+        return {
+            'active_count': len(self.active_memory),
+            'episodic_count': len(self.episodic_memory),
+            'cold_count': len(self.cold_storage),
+            'bridge_count': len(self.bridges),
+            'domain_count': len(self.domains),
+        }
+
+
+# =============================================================================
+# Example Usage
+# =============================================================================
+
+if __name__ == '__main__':
+    rng = np.random.default_rng(seed=42)  # reproducible demo
+
+    # Initialize memory system
+    memory = CMLLMMemory(embedding_dim=768)
+
+    print("=== Adding nodes to memory ===")
+    print("(stability is a function of how much the representation converges across layers)")
+    episodic_ids = []
+
+    claim_types = ['market_data', 'opinion', 'scientific_fact', 'mathematical']
+
+    for i in range(20):
+        ct = claim_types[i % len(claim_types)]
+        anchor = f"https://example.com/source_{i}"
+
+        if i < 8:
+            # Strongly convergent: each layer ≈ the previous → stability > 0.9 → active
+            base = rng.standard_normal(768)
+            layer_embeddings = [base + rng.standard_normal(768) * 0.005 for _ in range(8)]
+        elif i < 14:
+            # Moderately convergent: mix of base and noise → stability ~ 0.7–0.9 → episodic
+            # We interpolate: each layer is (1-t)*base + t*random, t grows across layers
+            base = rng.standard_normal(768)
+            layer_embeddings = [
+                (1 - 0.35 * (l / 7)) * base + 0.35 * (l / 7) * rng.standard_normal(768)
+                for l in range(8)
+            ]
+        else:
+            # Divergent: independent random directions → stability ~ 0.5 → cold
+            layer_embeddings = [rng.standard_normal(768) for _ in range(8)]
+
+        node_id, level = memory.add_node(anchor, ct, layer_embeddings)
+        stab = compute_stability(layer_embeddings)
+        print(f"  [{level:8s}] node {node_id[:8]}... | stability={stab:.3f} | claim={ct}")
+        if level == 'episodic':
+            episodic_ids.append(node_id)
+
+    # Demonstrate reinforce_node: promote an episodic hypothesis once an anchor is confirmed
+    if episodic_ids:
+        sample_id = episodic_ids[0]
+        print(f"\n--- Reinforcing episodic node {sample_id[:8]}... with confirmed anchor ---")
+        promoted = memory.reinforce_node(sample_id, anchor="https://example.com/confirmed_source")
+        print(f"Promoted to active memory: {promoted}")
+    
+    # Apply decay
+    print("\n=== Applying decay (1 day) ===")
+    moved = memory.apply_decay_to_all(dt=1.0)
+    print(f"Moved {len(moved)} nodes to cold storage")
+    
+    # Find bridges between domains
+    print("\n=== Clustering domains ===")
+    domains = memory.recluster_domains(n_clusters=3)
+    for cluster_id, node_ids in domains.items():
+        print(f"Domain {cluster_id}: {len(node_ids)} nodes")
+    
+    # Create a bridge between first two domains (if they exist)
+    if len(domains) >= 2:
+        domain_ids = list(domains.keys())
+        bridge = memory.find_bridge(domains[domain_ids[0]], domains[domain_ids[1]])
+        if bridge:
+            print(f"\nCreated bridge between domains {domain_ids[0]} and {domain_ids[1]} (error: {bridge.error:.3f})")
+        else:
+            print(f"\nNo bridge created (regions incompatible)")
+    
+    # Query
+    print("\n=== Querying memory ===")
+    query = np.random.randn(768)
+    results = memory.query(query, k=5)
+    for node_id, similarity in results:
+        print(f"Node {node_id[:8]}... (similarity: {similarity:.3f})")
+    
+    # Stats
+    print("\n=== Memory Statistics ===")
+    stats = memory.get_stats()
+    for key, value in stats.items():
+        print(f"{key}: {value}")
